@@ -1,0 +1,265 @@
+function [model] = LRSML1(data,opt)
+%------------------------------------------------------------------------%
+% Logistic Regression with Smooth Model via steepest descent SD (L2 version)
+% Minimize: L = - \sum_i \sum_k \log(p(k|xi)^{y_{ik}}) 
+%               + \lmda_1*\sum_k w_k^T*C*w_k
+%               + \lmda_2*\sum_k^{K-1} \|w_k - w_{k+1}\|^2_2 
+%               + \\beta*\sum_k^{K-1} \|w_k\| (to be implemented) 
+% Input:
+%     + data: struct data type
+%           .X[nFea nSmp]: dataset X 
+%           .gnd[1 nSmp]: class label
+%           .W[nFea nFea nClass]: network topo for nClass
+%     + opt: structure
+%           .lmda1: L2 tradeoff for network topo C(:,:,k)
+%           .lmda1: L2 tradeoff for smoothness
+%           .beta:  L1 tradeoff for fea selection
+%           .eta: learning rate (ignored as linesearch is used!)
+%           .verbose: boolean, used to print out results
+% Output:
+%     + model: struct data type
+%           .w[1+nFea, nClass]: Theta, each col for each model/class (1st for bias)
+%           .P[nSmp,nClass]: entry at row i col k: p(k|xi)
+%           .preproc: Xmu/Xstnd of data.X (used to normalize Xtest later)
+%           .f: negative log likelihood
+% Example: (c) 2015 Quang-Anh Dang - UCSB
+%------------------------------------------------------------------------%
+
+maxFunEvals = 2000;
+optTol = 1e-05;
+progTol = 1e-09;
+
+if (~exist('opt','var')),    opt = []; end
+
+maxIter = 200;
+if isfield(opt,'maxIter'), 
+    maxIter = opt.maxIter; 
+end
+
+if ~isfield(opt,'lmda1'),% tradeoff network
+    opt.lmda1=0.1;
+end
+
+if ~isfield(opt,'lmda2'),% tradeoff model smoothness
+    opt.lmda2 = 0;
+end
+
+%-- 2.Xnorm (0m/1stnd) then add bias fea
+preproc.standardizeX = 1;
+preproc.addOnes = 1;
+[data.X,preproc] = Xnorm(data.X,preproc);
+
+%-- 3. class labels with 1-K coding
+X = data.X'; y = data.gnd(:);
+nClass = nunique(y);
+yDummy = dummyEncoding(y, nClass); 
+
+if ~isfield(opt,'verbose'), opt.verbose = 0; end
+
+%-- for H computation
+
+%-- Build network-constrainted Laplacian C=Lc=Dc-Wc for each class
+nFea = size(X,2)-1; %excluding bias term
+C = zeros(nFea,nFea,nClass);
+Cdiag = zeros(nFea,nClass);
+if isfield(data,'W'),
+    if size(data.W,3)~=nClass
+        error('Mismatch #networks and nClass!');
+    end
+    for i=1:nClass
+        Dtmp = full(sum(data.W(:,:,i),2));
+        Ctmp = -data.W(:,:,i);
+        for j = 1 : size(Ctmp,1)
+            Ctmp(j,j) = Dtmp(j) + Ctmp(j,j);
+        end
+        C(:,:,i) = Ctmp;
+        Cdiag = diag(Ctmp);
+    end
+    clear Dtmp Ctmp
+else
+    for i=1:nClass, C(:,:,i) = eye(nFea);  end
+end
+
+
+nFea = size(X,2); % 1+nFea: including bias
+
+data.X = X;
+data.yDummy = yDummy;
+data.C = C;
+data.Cdiag = Cdiag;
+data.X2 = X.^2;
+
+
+% Initialize param
+w = zeros(nFea, nClass);
+
+[P,f,g,H] = softmaxUpdFull(w,data,opt);
+
+dta = zeros(nFea,nClass); 
+for i = 1:maxIter
+    wOld = w;
+    fOld = f;
+    for k=1:nClass
+        %-- H(j,k) MUST non-zero!!!
+        dta(1,k) = -g(1,k)/H(1,k); %-- bias term
+        for j=2:nFea %-- rand fea can be added here
+            if g(j,k)< H(j,k) -1
+                dta(j,k) = -(1+g(j,k))/H(j,k);
+            elseif g(j,k)> H(j,k) +1
+                dta(j,k) = (1-g(j,k))/H(j,k);
+            else
+                dta(j,k) = - w(j,k);
+                fprintf('0-coef fea: %4d \n',j);
+            end
+        end       
+        w(:,k) = w(:,k) + dta(:,k);
+    end
+    
+    %-- LineSearch here to ensure convergence (NOT implemented yet)
+    
+    
+   [P,f,g,H] = softmaxUpdFull(w,data,opt);
+
+   fprintf('iter: %4d  nll: %10.5f  g: %8.2f wDiff: %8.4f\n',...
+                i,f,sum(g(:).^2),sum((w(:)-wOld(:)).^2));
+    
+    %-- check convergence conditions (1st derv=0 or diff btw nll too small)
+    if max(abs(g)) <= optTol, disp('1st Derv is close to 0');break;end 
+    if abs(f-fOld) < progTol, disp('Function changing < progTol');break;end
+    if abs(f-fOld) > 0, disp('Function diverges!');break;end
+    if i == maxIter,disp('Reached Maximum Number of Iterations');end
+end
+
+model = saveModel(reshape(w, [nFea nClass]),P,f,preproc);
+
+end
+
+
+%-------------------------------------------------------------------------%
+
+function [P,nll,g,H] = softmaxUpdFull(w,data,opt)
+%-- Compute P(k|i), negLL, 1st derv g, 2nd derv H
+%-- Input:  + w[nFea nClass]: param for nClass including bias b in 1st row
+%           + data: 
+%               - X[nSmp nFea]: 1st col for bias term 
+%               - yDummy[nSmp nClass]: 1-K encoding class labels 
+%               - C[nFea-1 nFea-1 nClass]: network topo without bias
+%           + opt: .lmda1 .lmda2
+%-- Output:
+%           + P[nSmp nClass]: Pik = P(k|xi) = exp[(xi'*wk) - log sum_j(exp(xi'*wj)]
+%           + nll: scalar, sum of negLL
+%           + g[nFea*nClass 1]: 1st derv in stacking in 1 vector
+%           + H[]: 
+%-------------------------------------------------------------------------%
+
+
+
+lmda1 = opt.lmda1;
+lmda2 = opt.lmda2;
+
+X = data.X;
+yDummy = data.yDummy;
+nClass = size(yDummy,2);
+[nSmp,nFea] = size(X);
+
+%-- Precompute C*w (as used twice)
+Cw = zeros(nFea,nClass); %-- reg.mat, 1st row=0 for bias terms
+for k=1:nClass
+    Cw(2:end,k) = data.C(:,:,k)*w(2:end,k); %-- expensive
+end
+
+%-- 1. Compute negLL
+eta = X*w;                                  %-- eta(i,k) = xi'*wk
+% eta = eta - repmat(max(eta),size(eta,1),1); %-- avoid exp(.) too large
+Z = sum(exp(eta), 2);                       %-- Z(i)=sum_j exp(xi'*wj)
+lli = eta - repmat(log(Z),1,nClass);        %--lli(i,k): xi'*wk - log(sum_j(exp(xi'*wj)))
+ll = sum(lli .* yDummy, 2);                 %--ll(i) = yik*xi'*wk - log(sum_j(exp(xi'*wj)))
+nll = -sum(ll);
+
+
+for k=1:nClass 
+    %-- Add regu-network term w'Cw to nll
+    nll = nll + lmda1*w(2:end,k)'*Cw(2:end,k); 
+    %-- Add regu-smooth term ||wk - wk+1||^2  to nll
+    if k < nClass
+       nll = nll + lmda2*sum((w(2:end,k+1)-w(2:end,k)).^2);
+    end
+end
+
+
+%-- 2. Compute 1st derivative g=f'
+P = exp(lli);   %-- P(i,k) = p(k|xi)
+                % lli(i,k)  = (xi'*wk) - log sum_j(exp(xi'*wj))
+                % so exp(logLi(i,k)) = exp[(xi'*wk) - log sum_j(exp(xi'*wj)] = p(k|i)
+                
+g = zeros(nFea,nClass);
+for k = 1:nClass
+    %-- 1. derv of NLL term f'= -X*(yc-pc)
+    g(:,k) = -sum(X.*repmat(yDummy(:,k) - P(:,k),[1 nFea])); 
+    
+    %-- 2. add derv of network term
+    g(:,k) = g(:,k) + 2*lmda1*Cw(:,k);
+        
+    %-- 3. add derv of smooth term
+    if (k==1)
+        dLk = w(:,1) - w(:,2);
+    elseif(k==nClass)
+        dLk = w(:,end) - w(:,end-1);
+    else
+        dLk = 2*w(:,k) - w(:,k+1) - w(:,k-1);
+    end
+    g(:,k) = g(:,k) + 2*lmda2*dLk;
+    
+end
+
+
+% -- 3. (optional) Compute 2nd derivative H=f"
+% -- for each class: H = sum_i xi*xi'*pki(1- pki)
+% -- simplify H to H's diagonal only = sum_i (xi.^2)*pki(1- pki)
+
+
+if nargout > 3
+    H = zeros(nFea,nClass);     %-- each H is its diagonal vector
+    for k=1:nClass
+        H(:,k) = sum(data.X2.*repmat(P(:,k),1,nFea))';
+        
+        %-- add network term and smooth term
+        H(2:end,k) = H(2:end,k) + 2*lmda1*data.Cdiag(:,k) + 2*lmda2*ones(nFea-1,1);
+    end
+end
+
+%{
+if nargout > 3
+    H = zeros(nFea*(nClass));
+    for c1 = 1:nClass
+        for c2 = 1:nClass
+            D = P(:,c1).*((c1==c2)-P(:,c2));
+            H((nFea*(c1-1)+1):nFea*c1,(nFea*(c2-1)+1):nFea*c2) = X'*diag(sparse(D))*X;
+        end
+    end
+    
+    H = H + 2*lmda1*eye(length(w));
+end
+%}
+
+end
+%-------------------------------------------------------------------------%
+function [legal] = isLegal(v)
+legal = sum(any(imag(v(:))))==0 & sum(isnan(v(:)))==0 & sum(isinf(v(:)))==0;
+end
+
+%-------------------------------------------------------------------------%
+function model = saveModel(w,P,f,preproc)
+
+[nFea nClass] = size(w);
+model.w = w;
+model.P = P;
+model.preproc = preproc;
+model.f = f;
+model.nclasses = nClass;
+model.ySupport = (1:nClass)';
+model.modelType = 'logreg';
+end
+
+
+

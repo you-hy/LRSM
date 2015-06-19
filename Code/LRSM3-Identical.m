@@ -1,0 +1,374 @@
+function [model, X, lmda1Vec, res] = LRSM3(data,opt)
+%-- June17: cho kqua ychang LR voi LS_type = 0 (t param), SD/Armijio
+%------------------------------------------------------------------------%
+% Logistic Regression with Smooth Model via steepest descent SD (L2 version)
+% Minimize: L = - \sum_i \sum_k \log(p(k|xi)^{y_{ik}}) 
+%               + \lmda_1*\sum_k w_k^T*C*w_k
+%               + \lmda_2*\sum_k^{K-1} \|w_k - w_{k+1}\|^2_2 
+%               + \\beta*\sum_k^{K-1} \|w_k\| (not implemented) 
+% Input:
+%     + data: struct data type
+%           .X[nFea nSmp]: dataset X 
+%           .gnd[1 nSmp]: class label
+%           .W[nFea nFea nClass]: network topo for nClass
+%     + opt: structure
+%           .lmda1: L2 tradeoff for network topo C(:,:,k)
+%           .lmda1: L2 tradeoff for smoothness
+%           .beta:  L1 tradeoff for fea selection
+%           .eta: learning rate (ignored as linesearch is used!)
+%           .verbose: boolean, used to print out results
+% Output:
+%     + model: struct data type
+%           .w[1+nFea, nClass]: Theta, each col for each model/class (1st for bias)
+%           .P[nSmp,nClass]: entry at row i col k: p(k|xi)
+%           .preproc: Xmu/Xstnd of data.X (used to normalize Xtest later)
+%           .f: negative log likelihood
+% Example: (c) 2015 Quang-Anh Dang - UCSB
+%------------------------------------------------------------------------%
+
+if (~exist('opt','var')),    opt = []; end
+
+%-- 1. param for line search
+debug =  0;
+doPlot = 0;
+maxFunEvals = 2000;
+optTol =   1.0000e-05;
+progTol =   1.0000e-09;
+c1 =  1e-04;
+LS_interp =     2;
+LS_multi =     0;
+maxIter = 200;
+if isfield(opt,'maxIter'), 
+    maxIter = opt.maxIter; 
+end
+
+if ~isfield(opt,'lmda1'),% tradeoff network
+    opt.lmda1=0.1;
+end
+
+if ~isfield(opt,'lmda2'),% tradeoff model smoothness
+    opt.lmda2 = 0;
+end
+
+
+
+%-- 2.Xnorm (0m/1stnd) then add bias fea
+preproc.standardizeX = 1;
+preproc.addOnes = 1;
+[data.X,preproc] = Xnorm(data.X,preproc);
+
+
+%-- 3. class labels with 1-K coding
+X = data.X'; y = data.gnd(:);
+nClass = nunique(y);
+yDummy = dummyEncoding(y, nClass); %-- yi = (0,1,0) if xi is in 2nd class
+
+
+if ~isfield(opt,'verbose'), opt.verbose = 0; end
+
+%-- Build network-constrainted Laplacian C=Lc=Dc-Wc for each class
+nFea = size(X,2)-1; %excluding bias term
+C = zeros(nFea,nFea,nClass);
+if isfield(data,'W'),
+    if size(data.W,3)~=nClass
+        error('Mismatch #networks and nClass!');
+    end
+    
+    for i=1:nClass
+        Dtmp = full(sum(data.W(:,:,i),2));
+        Ctmp = -data.W(:,:,i);
+        for j = 1 : size(Ctmp,1)
+            Ctmp(j,j) = Dtmp(j) + Ctmp(j,j);
+        end
+        C(:,:,i) = Ctmp;
+    end
+    clear Dtmp Ctmp
+else
+    for i=1:nClass, C(:,:,i) = eye(nFea);  end
+end
+
+
+nFea = size(X,2); % 1+nFea: including bias
+funEvalMultiplier = 1; % If necessary, form numerical differentiation functions
+
+data.X = X;
+data.yDummy = yDummy;
+data.C = C;
+
+
+% Initialize param
+w0 = zeros(nFea, nClass);
+w = w0(:);
+[P,f,g] = softmaxUpdFull(w,data,opt);%-- nll, 1st derv from initial param
+
+funEvals = 1;
+
+for i = 1:maxIter
+    wOld = w;
+    %-- 1. DESCENT DIRECTION
+    d = -g;
+    if ~isLegal(d),error('Step direction is illegal');  end
+    
+    %-- 2. COMPUTE STEP LENGTH
+    gtd = g'*d;
+    
+    % Check that progress can be made along direction
+    if gtd > -progTol,disp('Directional Derivative below progTol');break;end
+    
+    if i == 1 % Select Initial Guess
+        t = min(1,1/sum(abs(g)));
+    else
+        t =1;
+%         t = min(1,2*(f-f_old)/(gtd));% See minFun for other t's
+%         if t <= 0,t = 1;end
+    end
+    
+    
+    fr = f; % Compute reference fr if using non-monotone objective
+    
+    %-- Line Search
+    f_old = f;
+    [t,w,f,g,LSfunEvals,P] = ArmijoBT(w,t,d,f,fr,g,gtd,...
+        c1,LS_interp,LS_multi,progTol,debug,doPlot,1,data,opt);
+    funEvals = funEvals + LSfunEvals;
+
+    fprintf('iter: %4d   nll: %10.5f  g: %8.2f t: %4.3f  wDiff: %8.4f\n',...
+                i,f,sum(g.^2),t,sum((w-wOld).^2));
+    
+    
+    if max(abs(g)) <= optTol, disp('Optimality Condition below optTol');break;end % Check Optimality Condition
+    if max(abs(t*d)) <= progTol, disp('Step Size below progTol');break;end
+    if abs(f-f_old) < progTol, disp('Function changing < progTol');break;end
+    if funEvals*funEvalMultiplier >= maxFunEvals
+        disp('Reached Maximum Number of Function Evaluations');break;
+    end
+    if i == maxIter,disp('Reached Maximum Number of Iterations');end
+    
+end
+
+
+model = saveModel(reshape(w, [nFea nClass]),P,f,preproc);
+end
+
+
+%-------------------------------------------------------------------------%
+
+function [t,x_new,f_new,g_new,funEvals,P,H] = ArmijoBT(...
+    x,t,d,f,fr,g,gtd,c1,LS_interp,LS_multi,progTol,debug,doPlot,saveHessianComp,data,opt)
+
+%-- KEY here: update new param by t*d, instead of learning rate!
+%     [f_new,g_new] = funObj(x+t*d);
+
+[P,f_new,g_new] = softmaxUpdFull(x+t*d,data,opt);
+
+funEvals = 1;
+
+while f_new > fr + c1*t*gtd || ~isLegal(f_new)
+    temp = t;
+    
+    if LS_interp == 0 || ~isLegal(f_new)
+        % Ignore value of new point
+        if debug
+            fprintf('Fixed BT\n');
+        end
+        t = 0.5*t;
+    elseif LS_interp == 1 || ~isLegal(g_new)
+        % Use function value at new point, but not its derivative
+        if funEvals < 2 || LS_multi == 0 || ~isLegal(f_prev)
+            % Backtracking w/ quadratic interpolation based on two points
+            if debug
+                fprintf('Quad BT\n');
+            end
+            t = polyinterp([0 f gtd; t f_new sqrt(-1)],doPlot,0,t);
+        else
+            % Backtracking w/ cubic interpolation based on three points
+            if debug
+                fprintf('Cubic BT\n');
+            end
+            t = polyinterp([0 f gtd; t f_new sqrt(-1); t_prev f_prev sqrt(-1)],doPlot,0,t);
+        end
+    else
+        % Use function value and derivative at new point
+        
+        if funEvals < 2 || LS_multi == 0 || ~isLegal(f_prev)
+            % Backtracking w/ cubic interpolation w/ derivative
+            if debug
+                fprintf('Grad-Cubic BT\n');
+            end
+            t = polyinterp([0 f gtd; t f_new g_new'*d],doPlot,0,t);
+        elseif ~isLegal(g_prev)
+            % Backtracking w/ quartic interpolation 3 points and derivative
+            % of two
+            if debug
+                fprintf('Grad-Quartic BT\n');
+            end
+            t = polyinterp([0 f gtd; t f_new g_new'*d; t_prev f_prev sqrt(-1)],doPlot,0,t);
+        else
+            % Backtracking w/ quintic interpolation of 3 points and derivative
+            % of two
+            if debug
+                fprintf('Grad-Quintic BT\n');
+            end
+            t = polyinterp([0 f gtd; t f_new g_new'*d; t_prev f_prev g_prev'*d],doPlot,0,t);
+        end
+    end
+    
+    % Adjust if change in t is too small/large
+    if t < temp*1e-3
+        if debug
+            fprintf('Interpolated Value Too Small, Adjusting\n');
+        end
+        t = temp*1e-3;
+    elseif t > temp*0.6
+        if debug
+            fprintf('Interpolated Value Too Large, Adjusting\n');
+        end
+        t = temp*0.6;
+    end
+    
+    % Store old point if doing three-point interpolation
+    if LS_multi
+        f_prev = f_new;
+        t_prev = temp;
+        if LS_interp == 2
+            g_prev = g_new;
+        end
+    end
+    
+    
+    [P,f_new,g_new] = softmaxUpdFull(x+t*d,data,opt);
+    
+    funEvals = funEvals+1;
+    
+    % Check whether step size has become too small
+    if max(abs(t*d)) <= progTol
+        if debug
+            fprintf('Backtracking Line Search Failed\n');
+        end
+        t = 0;
+        f_new = f;
+        g_new = g;
+        break;
+    end
+end
+
+% % Evaluate Hessian at new point
+% if nargout == 7 && funEvals > 1 && saveHessianComp
+%     [f_new,g_new,H] = funObj(x + t*d);
+%     funEvals = funEvals+1;
+% end
+
+x_new = x + t*d;
+
+end
+
+%-------------------------------------------------------------------------%
+
+function [P,nll,g,H] = softmaxUpdFull(w,data,opt)
+%-- Compute P(k|i), negLL, 1st derv g, 2nd derv H
+
+lmda1 = opt.lmda1;
+lmda2 = opt.lmda2;
+
+X = data.X;
+yDummy = data.yDummy;
+nClass = size(yDummy,2);
+[nSmp,nFea] = size(X);
+w = reshape(w,[nFea nClass]); %-- back to matrix form: [1+nFea*nClass]
+
+%-- Precompute C*w (used twice)
+Cw = zeros(nFea,nClass); %-- 1st row: bias terms 0
+for k=1:nClass
+    Cw(2:end,k) = data.C(:,:,k)*w(2:end,k); %-- expensive
+end
+
+%-- 1. Compute negLL
+eta = X*w;                                  %-- eta(i,k) = xi'*wk
+% eta = eta - repmat(max(eta),size(eta,1),1); %-- avoid exp(.) too large
+Z = sum(exp(eta), 2);                       %-- Z(i)=sum_j exp(xi'*wj)
+lli = eta - repmat(log(Z),1,nClass);        %--lli(i,k): xi'*wk - log(sum_j(exp(xi'*wj)))
+ll = sum(lli .* yDummy, 2);                 %--ll(i) = yik*xi'*wk - log(sum_j(exp(xi'*wj)))
+nll = -sum(ll);
+
+
+
+for k=1:nClass 
+    %-- Add regu-network term w'Cw to nll
+    nll = nll + lmda1*w(2:end,k)'*Cw(2:end,k); 
+    %-- Add regu-smooth term ||wk - wk+1||^2  to nll
+    if k<nClass
+       nll = nll + lmda2*sum((w(2:end,k+1)-w(2:end,k)).^2);
+    end
+end
+
+
+%-- 2. Compute 1st derivative g=f'
+P = exp(lli);   %-- P(i,k) = p(k|xi)
+                % lli(i,k)  = (xi'*wk) - log sum_j(exp(xi'*wj))
+                % so exp(logLi(i,k)) = exp[(xi'*wk) - log sum_j(exp(xi'*wj)] = p(k|i)
+                
+g = zeros(nFea,nClass);
+for k = 1:nClass
+    %-- 1. derv of NLL term f'= -X*(yc-pc)
+    g(:,k) = -sum(X.*repmat(yDummy(:,k) - P(:,k),[1 nFea])); 
+    
+    %-- 2. add derv of network term
+    g(:,k) = g(:,k) + 2*lmda1*Cw(:,k);
+        
+    %-- 3. add derv of smooth term
+    if (k==1)
+        dLk = w(:,1) - w(:,2);
+    elseif(k==nClass)
+        dLk = w(:,end) - w(:,end-1);
+    else
+        dLk = 2*w(:,k) - w(:,k+1) - w(:,k-1);
+    end
+    g(:,k) = g(:,k) + 2*lmda2*dLk;
+    
+end
+g = g(:); %-- convert g to col-vec 
+
+
+%{
+% -- 3. (optional) Compute 2nd derivative H=f"
+if nargout > 3
+    H = zeros(nFea*(nClass));
+    SM = P;
+    for c1 = 1:nClass
+        for c2 = 1:nClass
+            D = SM(:,c1).*((c1==c2)-SM(:,c2));
+            H((nFea*(c1-1)+1):nFea*c1,(nFea*(c2-1)+1):nFea*c2) = X'*diag(sparse(D))*X;
+        end
+    end
+end
+% if nargout > 3
+%     if isscalar(lmda1Vec)
+%         H = H + 2*lmda1Vec*eye(length(w));
+%     else
+%         H = H + diag(2*lmda1Vec);
+%     end
+% end
+%}
+
+end
+
+%-------------------------------------------------------------------------%
+function [legal] = isLegal(v)
+legal = sum(any(imag(v(:))))==0 & sum(isnan(v(:)))==0 & sum(isinf(v(:)))==0;
+end
+
+%-------------------------------------------------------------------------%
+function model = saveModel(w,P,f,preproc)
+
+[nFea nClass] = size(w);
+model.w = w;
+model.P = P;
+model.preproc = preproc;
+model.f = f;
+model.nclasses = nClass;
+model.ySupport = (1:nClass)';
+model.modelType = 'logreg';
+end
+
+
+
